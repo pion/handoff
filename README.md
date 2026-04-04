@@ -11,6 +11,9 @@
 </p>
 <br>
 
+### Usage
+**[basic](examples/basic)** is a minimal HTTP server that serves a browser demo with two local `RTCPeerConnection` instances exchanging DataChannel messages every second.
+
 ### Community
 Pion has an active community on the [Discord](https://discord.gg/PngbdqpFbt).
 

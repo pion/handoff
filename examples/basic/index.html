@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+  <!--
+    SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+    SPDX-License-Identifier: MIT
+  -->
+  <head>
+    <meta charset="utf-8">
+    <title>Handoff Basic Example</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 2rem;
+      }
+
+      .panel {
+        background-color: #f9f9f9;
+        border: 1px solid #ccc;
+        font-family: monospace;
+        min-height: 9rem;
+        overflow-y: auto;
+        padding: 0.75rem;
+      }
+
+      p {
+        margin: 0.25rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Handoff Basic Example</h1>
+    <p>
+      Two local RTCPeerConnections establish a DataChannel and exchange the
+      current time every second.
+    </p>
+    <button type="button" onclick="start(this)">Start</button>
+
+    <h3>Peer Connection States</h3>
+    <div id="connectionStates" class="panel"></div>
+
+    <h3>Messages Received by Offerer</h3>
+    <div id="offerMessages" class="panel"></div>
+
+    <h3>Messages Received by Answerer</h3>
+    <div id="answerMessages" class="panel"></div>
+
+    <script>
+      const offerer = new RTCPeerConnection();
+      const answerer = new RTCPeerConnection();
+      const offerChannel = offerer.createDataChannel('data');
+      const connectionStates = document.getElementById('connectionStates');
+      const offerMessages = document.getElementById('offerMessages');
+      const answerMessages = document.getElementById('answerMessages');
+
+      function addLine(container, text) {
+        const line = document.createElement('p');
+        line.textContent = text;
+        container.appendChild(line);
+      }
+
+      offerer.onconnectionstatechange = () => {
+        addLine(
+          connectionStates,
+          `Peer Connection State has changed: ${offerer.connectionState} (offerer)`,
+        );
+      };
+
+      answerer.onconnectionstatechange = () => {
+        addLine(
+          connectionStates,
+          `Peer Connection State has changed: ${answerer.connectionState} (answerer)`,
+        );
+      };
+
+      offerer.onicecandidate = event => {
+        if (event.candidate) {
+          answerer.addIceCandidate(event.candidate).catch(
+            error => addLine(connectionStates, `Offerer ICE error: ${error.message}`),
+          );
+        }
+      };
+
+      answerer.onicecandidate = event => {
+        if (event.candidate) {
+          offerer.addIceCandidate(event.candidate).catch(
+            error => addLine(connectionStates, `Answerer ICE error: ${error.message}`),
+          );
+        }
+      };
+
+      offerChannel.onopen = () => {
+        addLine(connectionStates, 'DataChannel opened (offerer)');
+        window.setInterval(() => offerChannel.send(new Date().toString()), 1000);
+      };
+
+      offerChannel.onmessage = event => {
+        addLine(offerMessages, `${new Date().toLocaleTimeString()} - ${event.data}`);
+      };
+
+      answerer.ondatachannel = event => {
+        const answerChannel = event.channel;
+
+        answerChannel.onopen = () => {
+          addLine(connectionStates, 'DataChannel opened (answerer)');
+          window.setInterval(() => answerChannel.send(new Date().toString()), 1000);
+        };
+
+        answerChannel.onmessage = messageEvent => {
+          addLine(
+            answerMessages,
+            `${new Date().toLocaleTimeString()} - ${messageEvent.data}`,
+          );
+        };
+      };
+
+      async function start(button) {
+        button.disabled = true;
+
+        try {
+          const offer = await offerer.createOffer();
+          await offerer.setLocalDescription(offer);
+          await answerer.setRemoteDescription(offer);
+
+          const answer = await answerer.createAnswer();
+          await answerer.setLocalDescription(answer);
+          await offerer.setRemoteDescription(answer);
+        } catch (error) {
+          button.disabled = false;
+          addLine(connectionStates, `Connection failed: ${error.message}`);
+          console.error('Connection failed:', error);
+        }
+      }
+    </script>
+  </body>
+</html>
