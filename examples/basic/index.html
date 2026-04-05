@@ -33,6 +33,7 @@
       Two local RTCPeerConnections establish a DataChannel and exchange the
       current time every second.
     </p>
+    <button type="button" onclick="override(this)">Override</button>
     <button type="button" onclick="start(this)">Start</button>
 
     <h3>Peer Connection States</h3>
@@ -45,17 +46,104 @@
     <div id="answerMessages" class="panel"></div>
 
     <script>
-      const offerer = new RTCPeerConnection();
-      const answerer = new RTCPeerConnection();
-      const offerChannel = offerer.createDataChannel('data');
       const connectionStates = document.getElementById('connectionStates');
       const offerMessages = document.getElementById('offerMessages');
       const answerMessages = document.getElementById('answerMessages');
+      const offerer = new RTCPeerConnection();
+      const offerChannel = offerer.createDataChannel('data');
+      const peerConnectionIDs = new WeakMap();
+
+      let answerer;
 
       function addLine(container, text) {
         const line = document.createElement('p');
         line.textContent = text;
         container.appendChild(line);
+      }
+
+      async function postEvent(event, data, id) {
+        const payload = { event, data };
+        if (id) {
+          payload.id = id;
+        }
+
+        const response = await fetch('/handoff', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          throw new Error(`handoff request failed with status ${response.status}`);
+        }
+
+        if (response.status === 204) {
+          return null;
+        }
+
+        return response.text();
+      }
+
+      function sendPeerConnectionEvent(pc, event, data) {
+        const idPromise = peerConnectionIDs.get(pc);
+        if (!idPromise) {
+          return;
+        }
+
+        void idPromise
+          .then(id => {
+            if (!id) {
+              return;
+            }
+
+            return postEvent(event, data, id);
+          })
+          .catch(() => {});
+      }
+
+      function wrapPeerConnection(pc, args) {
+        if (peerConnectionIDs.has(pc)) {
+          return pc;
+        }
+
+        peerConnectionIDs.set(
+          pc,
+          postEvent('new', args)
+            .then(responseID => responseID || null)
+            .catch(() => null),
+        );
+
+        for (const name of [
+          'createDataChannel',
+          'createOffer',
+          'setLocalDescription',
+          'setRemoteDescription',
+          'createAnswer',
+          'addIceCandidate',
+        ]) {
+          const original = pc[name].bind(pc);
+          pc[name] = (...methodArgs) => {
+            sendPeerConnectionEvent(pc, name, methodArgs);
+
+            return original(...methodArgs);
+          };
+        }
+
+        return pc;
+      }
+
+      function override(button) {
+        button.disabled = true;
+        const OriginalRTCPeerConnection = window.RTCPeerConnection;
+
+        wrapPeerConnection(offerer, []);
+        if (answerer) {
+          wrapPeerConnection(answerer, []);
+        }
+
+        window.RTCPeerConnection = function(...args) {
+          return wrapPeerConnection(new OriginalRTCPeerConnection(...args), args);
+        };
       }
 
       offerer.onconnectionstatechange = () => {
@@ -65,25 +153,10 @@
         );
       };
 
-      answerer.onconnectionstatechange = () => {
-        addLine(
-          connectionStates,
-          `Peer Connection State has changed: ${answerer.connectionState} (answerer)`,
-        );
-      };
-
       offerer.onicecandidate = event => {
-        if (event.candidate) {
+        if (answerer && event.candidate) {
           answerer.addIceCandidate(event.candidate).catch(
             error => addLine(connectionStates, `Offerer ICE error: ${error.message}`),
-          );
-        }
-      };
-
-      answerer.onicecandidate = event => {
-        if (event.candidate) {
-          offerer.addIceCandidate(event.candidate).catch(
-            error => addLine(connectionStates, `Answerer ICE error: ${error.message}`),
           );
         }
       };
@@ -97,26 +170,51 @@
         addLine(offerMessages, `${new Date().toLocaleTimeString()} - ${event.data}`);
       };
 
-      answerer.ondatachannel = event => {
-        const answerChannel = event.channel;
-
-        answerChannel.onopen = () => {
-          addLine(connectionStates, 'DataChannel opened (answerer)');
-          window.setInterval(() => answerChannel.send(new Date().toString()), 1000);
-        };
-
-        answerChannel.onmessage = messageEvent => {
-          addLine(
-            answerMessages,
-            `${new Date().toLocaleTimeString()} - ${messageEvent.data}`,
-          );
-        };
-      };
-
       async function start(button) {
         button.disabled = true;
 
         try {
+          answerer = new RTCPeerConnection();
+
+          answerer.onconnectionstatechange = () => {
+            addLine(
+              connectionStates,
+              `Peer Connection State has changed: ${answerer.connectionState} (answerer)`,
+            );
+          };
+
+          offerer.onicecandidate = event => {
+            if (event.candidate) {
+              answerer.addIceCandidate(event.candidate).catch(
+                error => addLine(connectionStates, `Offerer ICE error: ${error.message}`),
+              );
+            }
+          };
+
+          answerer.onicecandidate = event => {
+            if (event.candidate) {
+              offerer.addIceCandidate(event.candidate).catch(
+                error => addLine(connectionStates, `Answerer ICE error: ${error.message}`),
+              );
+            }
+          };
+
+          answerer.ondatachannel = event => {
+            const answerChannel = event.channel;
+
+            answerChannel.onopen = () => {
+              addLine(connectionStates, 'DataChannel opened (answerer)');
+              window.setInterval(() => answerChannel.send(new Date().toString()), 1000);
+            };
+
+            answerChannel.onmessage = messageEvent => {
+              addLine(
+                answerMessages,
+                `${new Date().toLocaleTimeString()} - ${messageEvent.data}`,
+              );
+            };
+          };
+
           const offer = await offerer.createOffer();
           await offerer.setLocalDescription(offer);
           await answerer.setRemoteDescription(offer);
@@ -127,7 +225,7 @@
         } catch (error) {
           button.disabled = false;
           addLine(connectionStates, `Connection failed: ${error.message}`);
-          console.error('Connection failed:', error);
+          postEvent('RTCPeerConnection.startError', [error.message]).catch(() => {});
         }
       }
     </script>
