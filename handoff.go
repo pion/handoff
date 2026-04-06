@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -39,6 +38,10 @@ type controlMessage struct {
 type Server struct {
 	mu       sync.Mutex
 	sessions map[*controlSession]struct{}
+
+	OnPeerConnection     func(*webrtc.PeerConnection)
+	OnDataChannel        func(*webrtc.DataChannel)
+	OnDataChannelMessage func(webrtc.DataChannelMessage)
 }
 
 type controlSession struct {
@@ -231,6 +234,9 @@ func (session *controlSession) newPeer(args []json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if session.server.OnPeerConnection != nil {
+		session.server.OnPeerConnection(pc)
+	}
 	peer := &managedPeer{id: id, session: session, pc: pc}
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		session.event(id, "connectionstatechange", "", map[string]string{
@@ -394,11 +400,16 @@ func (peer *managedPeer) registerDataChannel(dataChannel *webrtc.DataChannel) (s
 	if err != nil {
 		return "", err
 	}
+	if peer.session.server.OnDataChannel != nil {
+		peer.session.server.OnDataChannel(dataChannel)
+	}
 	dataChannel.OnOpen(func() {
 		peer.session.event(peer.id, "datachannelopen", dataChannelID, nil)
 	})
 	dataChannel.OnMessage(func(message webrtc.DataChannelMessage) {
-		fmt.Printf("%s - %s\n", time.Now().Format("3:04:05 PM"), string(message.Data))
+		if peer.session.server.OnDataChannelMessage != nil {
+			peer.session.server.OnDataChannelMessage(message)
+		}
 		peer.session.event(peer.id, "datachannelmessage", dataChannelID, map[string]string{
 			"data": string(message.Data),
 		})
