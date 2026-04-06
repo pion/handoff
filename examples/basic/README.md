@@ -5,7 +5,8 @@ redirect the answerer API to the backend while the offerer stays in the browser
 and sends
 DataChannel messages. The example mounts the root `github.com/pion/handoff`
 package on its own `http.ServeMux`, and `handoff.SetupHandlers` serves the root
-`handoff.js` browser library for the override path.
+`handoff.js` browser library for the override path. That library establishes one
+WebRTC control session per page/tab for the overridden API calls.
 
 ## Instructions
 

@@ -24,44 +24,52 @@ import (
 //go:embed handoff.js
 var handoffJavaScript []byte
 
-type handoffPayload struct {
-	ID    string          `json:"id,omitempty"`
-	Event string          `json:"event"`
-	Data  json.RawMessage `json:"data"`
-}
-
-type handoffEvent struct {
-	Name          string          `json:"name"`
-	DataChannelID string          `json:"dataChannelID,omitempty"`
-	Data          json.RawMessage `json:"data,omitempty"`
+type controlMessage struct {
+	Kind             string          `json:"kind"`
+	RequestID        string          `json:"requestId,omitempty"`
+	PeerConnectionID string          `json:"peerConnectionId,omitempty"`
+	Event            string          `json:"event,omitempty"`
+	Name             string          `json:"name,omitempty"`
+	DataChannelID    string          `json:"dataChannelId,omitempty"`
+	Data             json.RawMessage `json:"data,omitempty"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	Error            string          `json:"error,omitempty"`
 }
 
 type Server struct {
-	mu              sync.RWMutex
-	peerConnections map[string]*managedPeerConnection
+	mu       sync.Mutex
+	sessions map[*controlSession]struct{}
 }
 
-type managedPeerConnection struct {
-	peerConnection *webrtc.PeerConnection
+type controlSession struct {
+	server *Server
+	pc     *webrtc.PeerConnection
 
-	mu         sync.Mutex
-	eventQueue []handoffEvent
+	mu        sync.Mutex
+	closeOnce sync.Once
+
+	dc    *webrtc.DataChannel
+	peers map[string]*managedPeer
+}
+
+type managedPeer struct {
+	id      string
+	session *controlSession
+	pc      *webrtc.PeerConnection
+
+	closeOnce sync.Once
 }
 
 func NewServer() *Server {
-	return &Server{
-		peerConnections: map[string]*managedPeerConnection{},
-	}
+	return &Server{sessions: map[*controlSession]struct{}{}}
 }
 
 func (server *Server) SetupHandlers(mux *http.ServeMux) {
 	if mux == nil {
 		mux = http.DefaultServeMux
 	}
-
-	mux.HandleFunc("/handoff", server.handleRPC)
-	mux.HandleFunc("/handoff/events", server.handleEvents)
-	mux.HandleFunc("/handoff.js", func(responseWriter http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/handoff", server.handleBootstrap)
+	mux.HandleFunc("/handoff.js", func(responseWriter http.ResponseWriter, _ *http.Request) {
 		responseWriter.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		if _, err := responseWriter.Write(handoffJavaScript); err != nil {
 			fmt.Printf("Failed to write handoff.js: %v\n", err)
@@ -69,228 +77,262 @@ func (server *Server) SetupHandlers(mux *http.ServeMux) {
 	})
 }
 
-func (server *Server) handleRPC(responseWriter http.ResponseWriter, r *http.Request) {
+func (server *Server) handleBootstrap(responseWriter http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(responseWriter, "method not allowed", http.StatusMethodNotAllowed)
-
 		return
 	}
-
 	defer func() {
 		_ = r.Body.Close()
 	}()
-
-	var payload handoffPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(responseWriter, fmt.Sprintf("invalid event payload: %v", err), http.StatusBadRequest)
-
+	var request struct {
+		Offer webrtc.SessionDescription `json:"offer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(responseWriter, fmt.Sprintf("invalid bootstrap payload: %v", err), http.StatusBadRequest)
 		return
 	}
-
-	responseBody, statusCode, err := server.dispatch(payload)
+	answer, err := server.newControlSession(request.Offer)
 	if err != nil {
-		http.Error(responseWriter, err.Error(), statusCode)
-
+		http.Error(responseWriter, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if payload.Event == "new" {
-		payload.ID = responseBody
-	}
-	if responseBody == "" {
-		responseWriter.WriteHeader(http.StatusNoContent)
-
-		return
-	}
-
-	responseWriter.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	if _, err = responseWriter.Write([]byte(responseBody)); err != nil {
-		fmt.Printf("Failed to write handoff response: %v\n", err)
+	responseWriter.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err = json.NewEncoder(responseWriter).Encode(struct {
+		Answer webrtc.SessionDescription `json:"answer"`
+	}{Answer: answer}); err != nil {
+		fmt.Printf("Failed to write handoff bootstrap response: %v\n", err)
 	}
 }
 
-func (server *Server) handleEvents(responseWriter http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(responseWriter, "method not allowed", http.StatusMethodNotAllowed)
-
-		return
-	}
-
-	peerConnectionID := r.URL.Query().Get("id")
-	if peerConnectionID == "" {
-		http.Error(responseWriter, "missing peer connection id", http.StatusBadRequest)
-
-		return
-	}
-
-	managedPeerConnection, err := server.getPeerConnection(peerConnectionID)
+func (server *Server) newControlSession(offer webrtc.SessionDescription) (webrtc.SessionDescription, error) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
-		http.Error(responseWriter, err.Error(), http.StatusNotFound)
-
-		return
+		return webrtc.SessionDescription{}, fmt.Errorf("create control peer connection: %w", err)
+	}
+	session := &controlSession{
+		server: server,
+		pc:     pc,
+		peers:  map[string]*managedPeer{},
 	}
 
-	events := managedPeerConnection.drainEvents()
-	if len(events) == 0 {
-		responseWriter.WriteHeader(http.StatusNoContent)
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if terminalState(state) {
+			session.close()
+		}
+	})
+	pc.OnDataChannel(func(dataChannel *webrtc.DataChannel) {
+		if dataChannel.Label() == "handoff-control" {
+			session.attachControlChannel(dataChannel)
+		}
+	})
+	if err = pc.SetRemoteDescription(offer); err != nil {
+		session.close()
+		return webrtc.SessionDescription{}, fmt.Errorf("set control remote description: %w", err)
+	}
+	answer, err := localDescription(pc, func() (webrtc.SessionDescription, error) {
+		return pc.CreateAnswer(nil)
+	})
+	if err != nil {
+		session.close()
+		return webrtc.SessionDescription{}, fmt.Errorf("create control answer: %w", err)
+	}
+	server.mu.Lock()
+	server.sessions[session] = struct{}{}
+	server.mu.Unlock()
+	return answer, nil
+}
 
+func (session *controlSession) attachControlChannel(dataChannel *webrtc.DataChannel) {
+	session.mu.Lock()
+	if session.dc != nil {
+		session.mu.Unlock()
 		return
 	}
-
-	responseWriter.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	for index, event := range events {
-		eventJSON, err := json.Marshal(event)
-		if err != nil {
-			http.Error(responseWriter, fmt.Sprintf("failed to encode event: %v", err), http.StatusInternalServerError)
-
+	session.dc = dataChannel
+	session.mu.Unlock()
+	dataChannel.OnClose(func() {
+		session.close()
+	})
+	dataChannel.OnMessage(func(message webrtc.DataChannelMessage) {
+		var request controlMessage
+		if err := json.Unmarshal(message.Data, &request); err != nil {
+			fmt.Printf("Failed to decode control message: %v\n", err)
+			return
+		}
+		if request.Kind != "request" {
 			return
 		}
 
-		if index > 0 {
-			if _, err = responseWriter.Write([]byte("\n")); err != nil {
-				fmt.Printf("Failed to write handoff event separator: %v\n", err)
-
-				return
+		response := controlMessage{Kind: "response", RequestID: request.RequestID}
+		result, err := session.dispatch(request)
+		switch {
+		case err != nil:
+			response.Error = err.Error()
+		case result != nil:
+			if response.Result, err = json.Marshal(result); err != nil {
+				response.Error = fmt.Sprintf("failed to encode response: %v", err)
 			}
 		}
 
-		if _, err = responseWriter.Write(eventJSON); err != nil {
-			fmt.Printf("Failed to write handoff event: %v\n", err)
-
-			return
+		if err = session.send(response); err != nil {
+			fmt.Printf("Failed to send control response: %v\n", err)
 		}
-	}
+	})
 }
 
-func (server *Server) dispatch(payload handoffPayload) (string, int, error) {
-	args, err := decodeArgs(payload.Data)
+func (session *controlSession) dispatch(request controlMessage) (any, error) {
+	args, err := decodeArgs(request.Data)
 	if err != nil {
-		return "", http.StatusBadRequest, fmt.Errorf("failed to decode handoff arguments: %w", err)
+		return nil, fmt.Errorf("decode handoff arguments: %w", err)
 	}
-
-	if payload.Event == "new" {
-		id, err := server.newPeerConnection(args)
-		if err != nil {
-			return "", http.StatusInternalServerError, fmt.Errorf("failed to create peer connection: %w", err)
-		}
-
-		payload.ID = id
-
-		return id, http.StatusOK, nil
+	if request.Event == "new" {
+		return session.newPeer(args)
 	}
-
-	managedPeerConnection, err := server.getPeerConnection(payload.ID)
-	if err != nil {
-		return "", http.StatusNotFound, err
+	if request.PeerConnectionID == "" {
+		return nil, errors.New("missing peer connection id")
 	}
-
-	switch payload.Event {
+	session.mu.Lock()
+	peer := session.peers[request.PeerConnectionID]
+	session.mu.Unlock()
+	if peer == nil {
+		return nil, fmt.Errorf("unknown peer connection %q", request.PeerConnectionID)
+	}
+	switch request.Event {
 	case "createDataChannel":
-		dataChannelID, err := managedPeerConnection.createDataChannel(args)
-		if err != nil {
-			return "", http.StatusBadRequest, fmt.Errorf("failed to create data channel: %w", err)
-		}
-
-		return dataChannelID, http.StatusOK, nil
+		return peer.createDataChannel(args)
 	case "createOffer":
-		offer, err := managedPeerConnection.createOffer()
-		if err != nil {
-			return "", http.StatusInternalServerError, fmt.Errorf("failed to create offer: %w", err)
-		}
-
-		return offer, http.StatusOK, nil
+		return peer.createOffer()
 	case "setLocalDescription":
-		if err = managedPeerConnection.setLocalDescription(args); err != nil {
-			return "", http.StatusBadRequest, fmt.Errorf("failed to set local description: %w", err)
-		}
-
-		return "", http.StatusNoContent, nil
+		return nil, peer.setLocalDescription(args)
 	case "setRemoteDescription":
-		if err = managedPeerConnection.setRemoteDescription(args); err != nil {
-			return "", http.StatusBadRequest, fmt.Errorf("failed to set remote description: %w", err)
-		}
-
-		return "", http.StatusNoContent, nil
+		return nil, peer.setRemoteDescription(args)
 	case "createAnswer":
-		answer, err := managedPeerConnection.createAnswer()
-		if err != nil {
-			return "", http.StatusInternalServerError, fmt.Errorf("failed to create answer: %w", err)
-		}
-
-		return answer, http.StatusOK, nil
+		return peer.createAnswer()
 	case "addIceCandidate":
-		if err = managedPeerConnection.addICECandidate(args); err != nil {
-			return "", http.StatusBadRequest, fmt.Errorf("failed to add ICE candidate: %w", err)
-		}
-
-		return "", http.StatusNoContent, nil
+		return nil, peer.addICECandidate(args)
 	default:
-		return "", http.StatusBadRequest, fmt.Errorf("unsupported handoff event %q", payload.Event)
+		return nil, fmt.Errorf("unsupported handoff event %q", request.Event)
 	}
 }
 
-func (server *Server) newPeerConnection(args []json.RawMessage) (string, error) {
-	configuration, err := parsePeerConnectionConfiguration(args)
-	if err != nil {
-		return "", err
+func (session *controlSession) newPeer(args []json.RawMessage) (string, error) {
+	configuration := webrtc.Configuration{}
+	if len(args) > 0 && string(args[0]) != "null" {
+		if err := json.Unmarshal(args[0], &configuration); err != nil {
+			return "", err
+		}
 	}
-
-	peerConnection, err := webrtc.NewPeerConnection(configuration)
-	if err != nil {
-		return "", err
-	}
-
-	managedPeerConnection := &managedPeerConnection{
-		peerConnection: peerConnection,
-	}
-
-	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		managedPeerConnection.enqueueEvent("connectionstatechange", "", map[string]string{
-			"connectionState": state.String(),
-		})
-	})
-
-	peerConnection.OnDataChannel(func(dataChannel *webrtc.DataChannel) {
-		dataChannelID := managedPeerConnection.registerDataChannel(dataChannel)
-		managedPeerConnection.enqueueEvent("datachannel", dataChannelID, map[string]string{
-			"label": dataChannel.Label(),
-		})
-	})
-
 	id, err := newHandoffID()
 	if err != nil {
 		return "", err
 	}
-
-	server.mu.Lock()
-	server.peerConnections[id] = managedPeerConnection
-	server.mu.Unlock()
-
+	pc, err := webrtc.NewPeerConnection(configuration)
+	if err != nil {
+		return "", err
+	}
+	peer := &managedPeer{id: id, session: session, pc: pc}
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		session.event(id, "connectionstatechange", "", map[string]string{
+			"connectionState": state.String(),
+		})
+		if terminalState(state) {
+			peer.close()
+		}
+	})
+	pc.OnDataChannel(func(dataChannel *webrtc.DataChannel) {
+		dataChannelID, err := peer.registerDataChannel(dataChannel)
+		if err != nil {
+			fmt.Printf("Failed to register data channel: %v\n", err)
+			return
+		}
+		session.event(id, "datachannel", dataChannelID, map[string]string{
+			"label": dataChannel.Label(),
+		})
+	})
+	session.mu.Lock()
+	session.peers[id] = peer
+	session.mu.Unlock()
 	return id, nil
 }
 
-func (server *Server) getPeerConnection(id string) (*managedPeerConnection, error) {
-	if id == "" {
-		return nil, errors.New("missing peer connection id")
+func (session *controlSession) event(peerConnectionID, name, dataChannelID string, data any) {
+	message := controlMessage{
+		Kind:             "event",
+		PeerConnectionID: peerConnectionID,
+		Name:             name,
+		DataChannelID:    dataChannelID,
 	}
-
-	server.mu.RLock()
-	managedPeerConnection, ok := server.peerConnections[id]
-	server.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown peer connection %q", id)
+	if data != nil {
+		eventJSON, err := json.Marshal(data)
+		if err != nil {
+			fmt.Printf("Failed to encode handoff event payload: %v\n", err)
+			return
+		}
+		message.Data = eventJSON
 	}
-
-	return managedPeerConnection, nil
+	if err := session.send(message); err != nil {
+		fmt.Printf("Failed to send handoff event: %v\n", err)
+	}
 }
 
-func (managedPeerConnection *managedPeerConnection) createDataChannel(args []json.RawMessage) (string, error) {
+func (session *controlSession) send(message controlMessage) error {
+	messageJSON, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	session.mu.Lock()
+	dataChannel := session.dc
+	if dataChannel == nil {
+		session.mu.Unlock()
+		return errors.New("missing control channel")
+	}
+	defer session.mu.Unlock()
+	return dataChannel.SendText(string(messageJSON))
+}
+
+func (session *controlSession) close() {
+	session.closeOnce.Do(func() {
+		session.server.mu.Lock()
+		delete(session.server.sessions, session)
+		session.server.mu.Unlock()
+
+		session.mu.Lock()
+		peers := make([]*managedPeer, 0, len(session.peers))
+		for _, peer := range session.peers {
+			peers = append(peers, peer)
+		}
+		session.peers = map[string]*managedPeer{}
+		dataChannel := session.dc
+		session.dc = nil
+		session.mu.Unlock()
+		for _, peer := range peers {
+			peer.close()
+		}
+		if dataChannel != nil {
+			_ = dataChannel.Close()
+		}
+		_ = session.pc.Close()
+	})
+}
+
+func (peer *managedPeer) close() {
+	peer.closeOnce.Do(func() {
+		peer.session.mu.Lock()
+		delete(peer.session.peers, peer.id)
+		peer.session.mu.Unlock()
+
+		_ = peer.pc.Close()
+	})
+}
+
+func (peer *managedPeer) createDataChannel(args []json.RawMessage) (string, error) {
 	var label string
 	if len(args) > 0 {
 		if err := json.Unmarshal(args[0], &label); err != nil {
 			return "", err
 		}
 	}
-
 	var options *webrtc.DataChannelInit
 	if len(args) > 1 && string(args[1]) != "null" {
 		options = &webrtc.DataChannelInit{}
@@ -298,166 +340,81 @@ func (managedPeerConnection *managedPeerConnection) createDataChannel(args []jso
 			return "", err
 		}
 	}
-
-	dataChannel, err := managedPeerConnection.peerConnection.CreateDataChannel(label, options)
+	dataChannel, err := peer.pc.CreateDataChannel(label, options)
 	if err != nil {
 		return "", err
 	}
-
-	return managedPeerConnection.registerDataChannel(dataChannel), nil
+	return peer.registerDataChannel(dataChannel)
 }
 
-func (managedPeerConnection *managedPeerConnection) createOffer() (string, error) {
-	offer, err := managedPeerConnection.peerConnection.CreateOffer(nil)
-	if err != nil {
-		return "", err
-	}
-
-	gatherComplete := webrtc.GatheringCompletePromise(managedPeerConnection.peerConnection)
-	if err = managedPeerConnection.peerConnection.SetLocalDescription(offer); err != nil {
-		return "", err
-	}
-
-	<-gatherComplete
-
-	response, err := json.Marshal(managedPeerConnection.peerConnection.LocalDescription())
-	if err != nil {
-		return "", err
-	}
-
-	return string(response), nil
+func (peer *managedPeer) createOffer() (webrtc.SessionDescription, error) {
+	return localDescription(peer.pc, func() (webrtc.SessionDescription, error) {
+		return peer.pc.CreateOffer(nil)
+	})
 }
 
-func (managedPeerConnection *managedPeerConnection) setLocalDescription(args []json.RawMessage) error {
-	if managedPeerConnection.peerConnection.LocalDescription() != nil {
+func (peer *managedPeer) setLocalDescription(args []json.RawMessage) error {
+	if peer.pc.LocalDescription() != nil {
 		return nil
 	}
-
 	description, err := decodeSessionDescriptionArgument(args)
 	if err != nil {
 		return err
 	}
-
-	return managedPeerConnection.peerConnection.SetLocalDescription(description)
+	return peer.pc.SetLocalDescription(description)
 }
 
-func (managedPeerConnection *managedPeerConnection) setRemoteDescription(args []json.RawMessage) error {
+func (peer *managedPeer) setRemoteDescription(args []json.RawMessage) error {
 	description, err := decodeSessionDescriptionArgument(args)
 	if err != nil {
 		return err
 	}
-
-	return managedPeerConnection.peerConnection.SetRemoteDescription(description)
+	return peer.pc.SetRemoteDescription(description)
 }
 
-func (managedPeerConnection *managedPeerConnection) createAnswer() (string, error) {
-	answer, err := managedPeerConnection.peerConnection.CreateAnswer(nil)
-	if err != nil {
-		return "", err
-	}
-
-	gatherComplete := webrtc.GatheringCompletePromise(managedPeerConnection.peerConnection)
-	if err = managedPeerConnection.peerConnection.SetLocalDescription(answer); err != nil {
-		return "", err
-	}
-
-	<-gatherComplete
-
-	response, err := json.Marshal(managedPeerConnection.peerConnection.LocalDescription())
-	if err != nil {
-		return "", err
-	}
-
-	return string(response), nil
+func (peer *managedPeer) createAnswer() (webrtc.SessionDescription, error) {
+	return localDescription(peer.pc, func() (webrtc.SessionDescription, error) {
+		return peer.pc.CreateAnswer(nil)
+	})
 }
 
-func (managedPeerConnection *managedPeerConnection) addICECandidate(args []json.RawMessage) error {
+func (peer *managedPeer) addICECandidate(args []json.RawMessage) error {
 	if len(args) == 0 || string(args[0]) == "null" {
 		return nil
 	}
-
 	var candidate webrtc.ICECandidateInit
 	if err := json.Unmarshal(args[0], &candidate); err != nil {
 		return err
 	}
-
-	return managedPeerConnection.peerConnection.AddICECandidate(candidate)
+	return peer.pc.AddICECandidate(candidate)
 }
 
-func (managedPeerConnection *managedPeerConnection) registerDataChannel(dataChannel *webrtc.DataChannel) string {
+func (peer *managedPeer) registerDataChannel(dataChannel *webrtc.DataChannel) (string, error) {
 	dataChannelID, err := newHandoffID()
 	if err != nil {
-		panic(err)
+		return "", err
 	}
-
 	dataChannel.OnOpen(func() {
-		managedPeerConnection.enqueueEvent("datachannelopen", dataChannelID, nil)
+		peer.session.event(peer.id, "datachannelopen", dataChannelID, nil)
 	})
-
 	dataChannel.OnMessage(func(message webrtc.DataChannelMessage) {
 		fmt.Printf("%s - %s\n", time.Now().Format("3:04:05 PM"), string(message.Data))
-		managedPeerConnection.enqueueEvent("datachannelmessage", dataChannelID, map[string]string{
+		peer.session.event(peer.id, "datachannelmessage", dataChannelID, map[string]string{
 			"data": string(message.Data),
 		})
 	})
 
-	return dataChannelID
-}
-
-func (managedPeerConnection *managedPeerConnection) enqueueEvent(name, dataChannelID string, data any) {
-	event := handoffEvent{
-		Name:          name,
-		DataChannelID: dataChannelID,
-	}
-	if data != nil {
-		eventJSON, err := json.Marshal(data)
-		if err != nil {
-			fmt.Printf("Failed to encode handoff event payload: %v\n", err)
-
-			return
-		}
-
-		event.Data = eventJSON
-	}
-
-	managedPeerConnection.mu.Lock()
-	managedPeerConnection.eventQueue = append(managedPeerConnection.eventQueue, event)
-	managedPeerConnection.mu.Unlock()
-}
-
-func (managedPeerConnection *managedPeerConnection) drainEvents() []handoffEvent {
-	managedPeerConnection.mu.Lock()
-	defer managedPeerConnection.mu.Unlock()
-
-	events := append([]handoffEvent(nil), managedPeerConnection.eventQueue...)
-	managedPeerConnection.eventQueue = managedPeerConnection.eventQueue[:0]
-
-	return events
-}
-
-func parsePeerConnectionConfiguration(args []json.RawMessage) (webrtc.Configuration, error) {
-	if len(args) == 0 || string(args[0]) == "null" {
-		return webrtc.Configuration{}, nil
-	}
-
-	var configuration webrtc.Configuration
-	if err := json.Unmarshal(args[0], &configuration); err != nil {
-		return webrtc.Configuration{}, err
-	}
-
-	return configuration, nil
+	return dataChannelID, nil
 }
 
 func decodeSessionDescriptionArgument(args []json.RawMessage) (webrtc.SessionDescription, error) {
 	if len(args) == 0 {
 		return webrtc.SessionDescription{}, errors.New("missing session description")
 	}
-
 	var description webrtc.SessionDescription
 	if err := json.Unmarshal(args[0], &description); err != nil {
 		return webrtc.SessionDescription{}, err
 	}
-
 	return description, nil
 }
 
@@ -465,13 +422,33 @@ func decodeArgs(data json.RawMessage) ([]json.RawMessage, error) {
 	if len(data) == 0 || string(data) == "null" {
 		return nil, nil
 	}
-
 	var args []json.RawMessage
 	if err := json.Unmarshal(data, &args); err != nil {
 		return nil, err
 	}
-
 	return args, nil
+}
+
+func localDescription(
+	peerConnection *webrtc.PeerConnection,
+	create func() (webrtc.SessionDescription, error),
+) (webrtc.SessionDescription, error) {
+	description, err := create()
+	if err != nil {
+		return webrtc.SessionDescription{}, err
+	}
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	if err = peerConnection.SetLocalDescription(description); err != nil {
+		return webrtc.SessionDescription{}, err
+	}
+	<-gatherComplete
+	return *peerConnection.LocalDescription(), nil
+}
+
+func terminalState(state webrtc.PeerConnectionState) bool {
+	return state == webrtc.PeerConnectionStateClosed ||
+		state == webrtc.PeerConnectionStateDisconnected ||
+		state == webrtc.PeerConnectionStateFailed
 }
 
 func newHandoffID() (string, error) {
@@ -479,6 +456,5 @@ func newHandoffID() (string, error) {
 	if _, err := rand.Read(randomBytes); err != nil {
 		return "", err
 	}
-
 	return hex.EncodeToString(randomBytes), nil
 }
