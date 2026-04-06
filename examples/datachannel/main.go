@@ -3,7 +3,7 @@
 
 //go:build !js
 
-// basic demonstrates serving a static HTML page over HTTP.
+// datachannel demonstrates serving a static HTML page over HTTP.
 package main
 
 import (

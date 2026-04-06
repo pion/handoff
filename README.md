@@ -12,7 +12,7 @@
 <br>
 
 ### Usage
-**[basic](examples/basic)** is a minimal HTTP server that serves a browser demo where the offerer sends DataChannel messages every second, and the answerer API can be redirected to the backend with proxied `RTCPeerConnection` method calls over a WebRTC control session.
+**[datachannel](examples/datachannel)** is a minimal HTTP server that serves a browser demo where the offerer sends DataChannel messages every second, and the answerer API can be redirected to the backend with proxied `RTCPeerConnection` method calls over a WebRTC control session.
 
 The root package exposes `handoff.NewServer()` and `server.SetupHandlers(mux)` so you can mount the handoff endpoints and serve the browser-side [`handoff.js`](handoff.js) override library from your own `http.ServeMux`. The browser library exposes `handoff.Start()` and establishes one WebRTC control session per page/tab.
 

@@ -1,5 +1,5 @@
 # basic
-basic demonstrates serving a browser page from a Go HTTP server. Click `Start`
+datachannel demonstrates serving a browser page from a Go HTTP server. Click `Start`
 to run two local browser RTCPeerConnections, or enable `Override` first to
 redirect the answerer API to the backend while the offerer stays in the browser
 and sends
