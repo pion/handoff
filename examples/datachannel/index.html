@@ -34,10 +34,10 @@
       Override first to redirect the answerer API to the backend.
     </p>
     <label>
-      <input id="overrideCheckbox" type="checkbox" onchange="toggleOverride(this)">
+      <input id="overrideCheckbox" type="checkbox" onchange="toggleOverride()">
       Override
     </label>
-    <button id="startButton" type="button" onclick="start(this)">Start</button>
+    <button id="startButton" type="button" onclick="start()">Start</button>
 
     <h3>Peer Connection States</h3>
     <div id="connectionStates" class="panel"></div>
@@ -50,15 +50,28 @@
 
     <script src="/handoff.js"></script>
     <script>
+      const overrideCheckbox = document.getElementById('overrideCheckbox');
+
+      function toggleOverride() {
+        if (overrideCheckbox.checked) {
+          logState('Override enabled: the answerer API will be redirected to the backend.');
+          handoff.Start();
+
+          return;
+        }
+
+        logState('Override disabled: the answerer API will no longer be redirected to the backend.');
+        handoff.Stop();
+      }
+
+      // Bove is the only handoff-specific code in the page. Everything below
+      // is standard WebRTC app code
       const connectionStates = document.getElementById('connectionStates');
       const offerMessages = document.getElementById('offerMessages');
       const answerMessages = document.getElementById('answerMessages');
-      const overrideCheckbox = document.getElementById('overrideCheckbox');
       const startButton = document.getElementById('startButton');
 
-      let overrideInstalled = false;
       let offerer;
-      let offerChannel;
       let answerer;
 
       function addLine(container, text) {
@@ -67,105 +80,79 @@
         container.appendChild(line);
       }
 
-      function setupOfferer() {
-        offerer = new RTCPeerConnection();
-        offerChannel = offerer.createDataChannel('data');
+      function logState(text) {
+        addLine(connectionStates, text);
+      }
 
-        offerer.onconnectionstatechange = () => {
+      function logConnectionState(name, peerConnection) {
+        logState(`Peer Connection State has changed: ${peerConnection.connectionState} (${name})`);
+      }
+
+      function showAnswererMessages(dataChannel) {
+        dataChannel.onopen = () => {
+          logState('DataChannel opened (answerer)');
+        };
+
+        dataChannel.onmessage = messageEvent => {
           addLine(
-            connectionStates,
-            `Peer Connection State has changed: ${offerer.connectionState} (offerer)`,
+            answerMessages,
+            `${new Date().toLocaleTimeString()} - ${messageEvent.data}`,
           );
-        };
-
-        offerChannel.onopen = () => {
-          addLine(connectionStates, 'DataChannel opened (offerer)');
-          window.setInterval(() => {
-            const message = new Date().toString();
-            addLine(
-              offerMessages,
-              `${new Date().toLocaleTimeString()} - ${message}`,
-            );
-            offerChannel.send(message);
-          }, 1000);
-        };
-
-        offerer.onicecandidate = event => {
-          if (answerer && event.candidate) {
-            answerer.addIceCandidate(event.candidate).catch(
-              error => addLine(connectionStates, `Offerer ICE error: ${error.message}`),
-            );
-          }
         };
       }
 
-      function toggleOverride(checkbox) {
-        if (checkbox.checked) {
-          if (overrideInstalled) {
+      function createOfferer() {
+        const peerConnection = new RTCPeerConnection();
+        const dataChannel = peerConnection.createDataChannel('data');
+
+        peerConnection.onconnectionstatechange = () => {
+          logConnectionState('offerer', peerConnection);
+        };
+
+        peerConnection.onicecandidate = ({ candidate }) => {
+          if (!answerer || !candidate) {
             return;
           }
 
-          overrideInstalled = true;
-          addLine(
-            connectionStates,
-            'Override enabled: the answerer API will be redirected to the backend.',
-          );
-          handoff.Start();
+          answerer.addIceCandidate(candidate).catch(error => {
+            logState(`Offerer ICE error: ${error.message}`);
+          });
+        };
 
-          return;
-        }
+        dataChannel.onopen = () => {
+          logState('DataChannel opened (offerer)');
+          window.setInterval(() => {
+            const message = new Date().toString();
+            addLine(offerMessages, `${new Date().toLocaleTimeString()} - ${message}`);
+            dataChannel.send(message);
+          }, 1000);
+        };
 
-        if (!overrideInstalled) {
-          return;
-        }
-
-        overrideInstalled = false;
-        addLine(
-          connectionStates,
-          'Override disabled: the answerer API will no longer be redirected to the backend.',
-        );
-        handoff.Stop();
+        return peerConnection;
       }
 
-      setupOfferer();
+      // Create the offerer before any override so it always stays in the browser.
+      offerer = createOfferer();
 
-      async function start(button) {
-        button.disabled = true;
-        overrideCheckbox.disabled = true;
-
+      async function start() {
         try {
           answerer = new RTCPeerConnection();
 
-          if (!overrideInstalled) {
-            answerer.onconnectionstatechange = () => {
-              addLine(
-                connectionStates,
-                `Peer Connection State has changed: ${answerer.connectionState} (answerer)`,
-              );
-            };
+          answerer.onconnectionstatechange = () => {
+            logConnectionState('answerer', answerer);
+          };
+          answerer.ondatachannel = event => {
+            showAnswererMessages(event.channel);
+          };
 
-            answerer.ondatachannel = event => {
-              const answerChannel = event.channel;
-
-              answerChannel.onopen = () => {
-                addLine(connectionStates, 'DataChannel opened (answerer)');
-              };
-
-              answerChannel.onmessage = messageEvent => {
-                addLine(
-                  answerMessages,
-                  `${new Date().toLocaleTimeString()} - ${messageEvent.data}`,
-                );
-              };
-            };
-          }
-
-          answerer.onicecandidate = event => {
-            if (event.candidate) {
-              offerer.addIceCandidate(event.candidate).catch(
-                error => addLine(connectionStates, `Answerer ICE error: ${error.message}`),
-              );
+          answerer.onicecandidate = ({ candidate }) => {
+            if (!candidate) {
+              return;
             }
+
+            offerer.addIceCandidate(candidate).catch(error => {
+              logState(`Answerer ICE error: ${error.message}`);
+            });
           };
 
           const offer = await offerer.createOffer();
@@ -176,8 +163,7 @@
           await answerer.setLocalDescription(answer);
           await offerer.setRemoteDescription(answer);
         } catch (error) {
-          button.disabled = false;
-          addLine(connectionStates, `Connection failed: ${error.message}`);
+          logState(`Connection failed: ${error.message}`);
         }
       }
     </script>

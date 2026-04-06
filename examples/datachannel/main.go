@@ -24,8 +24,10 @@ func main() {
 	server.OnDataChannel = func(dataChannel *webrtc.DataChannel) {
 		fmt.Printf("DataChannel created on backend: %s\n", dataChannel.Label())
 	}
-	server.OnDataChannelMessage = func(message webrtc.DataChannelMessage) {
+	server.OnDataChannelMessage = func(message webrtc.DataChannelMessage) bool {
 		fmt.Printf("%s - %s\n", time.Now().Format("3:04:05 PM"), string(message.Data))
+
+		return false
 	}
 	server.SetupHandlers(mux)
 	mux.HandleFunc("/", func(responseWriter http.ResponseWriter, r *http.Request) {

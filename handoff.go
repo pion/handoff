@@ -41,7 +41,7 @@ type Server struct {
 
 	OnPeerConnection     func(*webrtc.PeerConnection)
 	OnDataChannel        func(*webrtc.DataChannel)
-	OnDataChannelMessage func(webrtc.DataChannelMessage)
+	OnDataChannelMessage func(webrtc.DataChannelMessage) bool
 }
 
 type controlSession struct {
@@ -407,8 +407,9 @@ func (peer *managedPeer) registerDataChannel(dataChannel *webrtc.DataChannel) (s
 		peer.session.event(peer.id, "datachannelopen", dataChannelID, nil)
 	})
 	dataChannel.OnMessage(func(message webrtc.DataChannelMessage) {
-		if peer.session.server.OnDataChannelMessage != nil {
-			peer.session.server.OnDataChannelMessage(message)
+		if peer.session.server.OnDataChannelMessage != nil &&
+			!peer.session.server.OnDataChannelMessage(message) {
+			return
 		}
 		peer.session.event(peer.id, "datachannelmessage", dataChannelID, map[string]string{
 			"data": string(message.Data),
