@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -22,6 +23,10 @@ import (
 
 //go:embed handoff.js
 var handoffJavaScript []byte
+
+func JavaScript() string {
+	return string(handoffJavaScript)
+}
 
 type controlMessage struct {
 	Kind             string          `json:"kind"`
@@ -38,6 +43,7 @@ type controlMessage struct {
 type Server struct {
 	mu       sync.Mutex
 	sessions map[*controlSession]struct{}
+	logger   *log.Logger
 
 	OnPeerConnection     func(*webrtc.PeerConnection)
 	OnDataChannel        func(*webrtc.DataChannel)
@@ -63,8 +69,23 @@ type managedPeer struct {
 	closeOnce sync.Once
 }
 
-func NewServer() *Server {
-	return &Server{sessions: map[*controlSession]struct{}{}}
+type Option func(*Server)
+
+func WithMessageLogger(logger *log.Logger) Option {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return func(server *Server) {
+		server.logger = logger
+	}
+}
+
+func NewServer(options ...Option) *Server {
+	server := &Server{sessions: map[*controlSession]struct{}{}}
+	for _, option := range options {
+		option(server)
+	}
+	return server
 }
 
 func (server *Server) SetupHandlers(mux *http.ServeMux) {
@@ -95,15 +116,18 @@ func (server *Server) handleBootstrap(responseWriter http.ResponseWriter, r *htt
 		http.Error(responseWriter, fmt.Sprintf("invalid bootstrap payload: %v", err), http.StatusBadRequest)
 		return
 	}
+	server.logMessage("handoff <- bootstrap", request)
 	answer, err := server.newControlSession(request.Offer)
 	if err != nil {
 		http.Error(responseWriter, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	responseWriter.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err = json.NewEncoder(responseWriter).Encode(struct {
+	response := struct {
 		Answer webrtc.SessionDescription `json:"answer"`
-	}{Answer: answer}); err != nil {
+	}{Answer: answer}
+	server.logMessage("handoff -> bootstrap", response)
+	responseWriter.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err = json.NewEncoder(responseWriter).Encode(response); err != nil {
 		fmt.Printf("Failed to write handoff bootstrap response: %v\n", err)
 	}
 }
@@ -166,6 +190,7 @@ func (session *controlSession) attachControlChannel(dataChannel *webrtc.DataChan
 		if request.Kind != "request" {
 			return
 		}
+		session.server.logMessage("handoff <- control", request)
 
 		response := controlMessage{Kind: "response", RequestID: request.RequestID}
 		result, err := session.dispatch(request)
@@ -177,6 +202,7 @@ func (session *controlSession) attachControlChannel(dataChannel *webrtc.DataChan
 				response.Error = fmt.Sprintf("failed to encode response: %v", err)
 			}
 		}
+		session.server.logMessage("handoff -> control", response)
 
 		if err = session.send(response); err != nil {
 			fmt.Printf("Failed to send control response: %v\n", err)
@@ -295,6 +321,18 @@ func (session *controlSession) send(message controlMessage) error {
 	}
 	defer session.mu.Unlock()
 	return dataChannel.SendText(string(messageJSON))
+}
+
+func (server *Server) logMessage(prefix string, message any) {
+	if server.logger == nil {
+		return
+	}
+	messageJSON, err := json.Marshal(message)
+	if err != nil {
+		server.logger.Printf("%s: %v", prefix, err)
+		return
+	}
+	server.logger.Printf("%s %s", prefix, messageJSON)
 }
 
 func (session *controlSession) close() {
