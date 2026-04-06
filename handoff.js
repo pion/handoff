@@ -8,6 +8,7 @@
   const originalRTCPeerConnection = globalObject.RTCPeerConnection;
 
   let handoffURL = '/handoff';
+  let bootstrap = null;
   let started = false;
   let controlSessionPromise = null;
 
@@ -42,11 +43,14 @@
     });
   }
 
-  function createDataChannelProxy(label) {
+  function createDataChannelProxy(label, sendText = () => {}) {
     return {
       label,
       onopen: null,
       onmessage: null,
+      send(data) {
+        sendText(String(data));
+      },
     };
   }
 
@@ -158,19 +162,26 @@
     await controlPeerConnection.setLocalDescription(offer);
     await waitForIceGatheringComplete(controlPeerConnection);
 
-    const response = await globalObject.fetch(handoffURL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ offer: controlPeerConnection.localDescription }),
-    });
-    if (!response.ok) {
-      close(new Error(`handoff bootstrap failed with status ${response.status}`));
+    let answer;
+    if (bootstrap) {
+      answer = await bootstrap(controlPeerConnection.localDescription);
+    } else {
+      const response = await globalObject.fetch(handoffURL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ offer: controlPeerConnection.localDescription }),
+      });
+      if (!response.ok) {
+        close(new Error(`handoff bootstrap failed with status ${response.status}`));
 
-      throw new Error(`handoff bootstrap failed with status ${response.status}`);
+        throw new Error(`handoff bootstrap failed with status ${response.status}`);
+      }
+
+      const payload = await response.json();
+      answer = payload.answer;
     }
 
-    const payload = await response.json();
-    await controlPeerConnection.setRemoteDescription(payload.answer);
+    await controlPeerConnection.setRemoteDescription(answer);
     await readyPromise;
 
     return {
@@ -259,7 +270,9 @@
 
             return;
           case 'datachannel': {
-            const dataChannel = createDataChannelProxy(handoffEvent.data.label);
+            const dataChannel = createDataChannelProxy(handoffEvent.data.label, data => {
+              void this.enqueueCall('sendDataChannelMessage', [handoffEvent.dataChannelId, data]);
+            });
             dataChannels.set(handoffEvent.dataChannelId, dataChannel);
             dispatchHandler(this.ondatachannel, { channel: dataChannel });
 
@@ -282,18 +295,19 @@
         }
       },
       createDataChannel(label, options) {
-        let dataChannel;
-        const dataChannelID = this.enqueueCall('createDataChannel', [label, options ?? null])
-          .then(responseID => {
-            if (responseID) {
-              dataChannels.set(responseID, dataChannel);
+        const dataChannelID = this.enqueueCall('createDataChannel', [label, options ?? null]);
+        const dataChannel = createDataChannelProxy(label, data => {
+          void dataChannelID.then(id => {
+            if (id) {
+              return this.enqueueCall('sendDataChannelMessage', [id, data]);
             }
-
-            return responseID || '';
           });
-
-        dataChannel = createDataChannelProxy(label);
-
+        });
+        void dataChannelID.then(id => {
+          if (id) {
+            dataChannels.set(id, dataChannel);
+          }
+        });
         return dataChannel;
       },
       async createOffer() {
@@ -329,6 +343,7 @@
     }
 
     handoffURL = options.handoffURL ?? handoffURL;
+    bootstrap = options.bootstrap ?? null;
     globalObject.RTCPeerConnection = function(...args) {
       return wrapPeerConnection(args);
     };
@@ -347,6 +362,7 @@
     started = false;
     controlSessionPromise = null;
     handoffURL = '/handoff';
+    bootstrap = null;
     globalObject.RTCPeerConnection = originalRTCPeerConnection;
 
     if (sessionPromise) {

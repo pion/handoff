@@ -65,6 +65,7 @@ type managedPeer struct {
 	id      string
 	session *controlSession
 	pc      *webrtc.PeerConnection
+	dcs     map[string]*webrtc.DataChannel
 
 	closeOnce sync.Once
 }
@@ -240,6 +241,8 @@ func (session *controlSession) dispatch(request controlMessage) (any, error) {
 		return peer.createAnswer()
 	case "addIceCandidate":
 		return nil, peer.addICECandidate(args)
+	case "sendDataChannelMessage":
+		return nil, peer.sendDataChannelMessage(args)
 	default:
 		return nil, fmt.Errorf("unsupported handoff event %q", request.Event)
 	}
@@ -263,7 +266,7 @@ func (session *controlSession) newPeer(args []json.RawMessage) (string, error) {
 	if session.server.OnPeerConnection != nil {
 		session.server.OnPeerConnection(pc)
 	}
-	peer := &managedPeer{id: id, session: session, pc: pc}
+	peer := &managedPeer{id: id, session: session, pc: pc, dcs: map[string]*webrtc.DataChannel{}}
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		session.event(id, "connectionstatechange", "", map[string]string{
 			"connectionState": state.String(),
@@ -433,11 +436,35 @@ func (peer *managedPeer) addICECandidate(args []json.RawMessage) error {
 	return peer.pc.AddICECandidate(candidate)
 }
 
+func (peer *managedPeer) sendDataChannelMessage(args []json.RawMessage) error {
+	if len(args) < 2 {
+		return errors.New("missing data channel message arguments")
+	}
+	var dataChannelID string
+	if err := json.Unmarshal(args[0], &dataChannelID); err != nil {
+		return err
+	}
+	var message string
+	if err := json.Unmarshal(args[1], &message); err != nil {
+		return err
+	}
+	peer.session.mu.Lock()
+	dataChannel := peer.dcs[dataChannelID]
+	peer.session.mu.Unlock()
+	if dataChannel == nil {
+		return fmt.Errorf("unknown data channel %q", dataChannelID)
+	}
+	return dataChannel.SendText(message)
+}
+
 func (peer *managedPeer) registerDataChannel(dataChannel *webrtc.DataChannel) (string, error) {
 	dataChannelID, err := newHandoffID()
 	if err != nil {
 		return "", err
 	}
+	peer.session.mu.Lock()
+	peer.dcs[dataChannelID] = dataChannel
+	peer.session.mu.Unlock()
 	if peer.session.server.OnDataChannel != nil {
 		peer.session.server.OnDataChannel(dataChannel)
 	}

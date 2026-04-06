@@ -34,7 +34,11 @@ sequenceDiagram
 
 ### Usage
 
-See `examples` directory. Most common use cases are covered, but `handshake` is exposed as an API if you want to add custom behavior.
+See `examples` directory. `examples/datachannel` shows a normal page with an
+optional override, and `examples/greasemonkey` generates a userscript that
+overrides `RTCPeerConnection` automatically.
+
+Typically you will install the greasemonkey script and then run one of the examples.
 
 ### Community
 Pion has an active community on the [Discord](https://discord.gg/PngbdqpFbt).
