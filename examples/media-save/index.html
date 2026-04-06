@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+  <!--
+    SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+    SPDX-License-Identifier: MIT
+  -->
+  <head>
+    <meta charset="utf-8">
+    <title>Handoff Media Save Example</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 2rem;
+      }
+
+      .videos {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+        margin-top: 1rem;
+      }
+
+      .panel {
+        background-color: #f9f9f9;
+        border: 1px solid #ccc;
+        font-family: monospace;
+        min-height: 9rem;
+        overflow-y: auto;
+        padding: 0.75rem;
+      }
+
+      video {
+        background: #000;
+        width: 100%;
+      }
+
+      p {
+        margin: 0.25rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Handoff Media Save Example</h1>
+    <p>
+      Click Start and allow camera access to create a local video call. Enable
+      Override first to move the answerer to the backend, save the incoming
+      video to disk, and loop the video back to the browser.
+    </p>
+    <label>
+      <input id="overrideCheckbox" type="checkbox" onchange="toggleOverride()">
+      Override
+    </label>
+    <button id="startButton" type="button" onclick="start()">Start</button>
+
+    <div class="videos">
+      <div>
+        <h3>Local Camera</h3>
+        <video id="localVideo" autoplay muted playsinline></video>
+      </div>
+      <div>
+        <h3>Remote Video</h3>
+        <video id="remoteVideo" autoplay playsinline controls></video>
+      </div>
+    </div>
+
+    <h3>Peer Connection States</h3>
+    <div id="connectionStates" class="panel"></div>
+
+    <script src="/handoff.js"></script>
+    <script>
+      const NativeRTCPeerConnection = window.RTCPeerConnection;
+      const connectionStates = document.getElementById('connectionStates');
+      const localVideo = document.getElementById('localVideo');
+      const remoteVideo = document.getElementById('remoteVideo');
+      const overrideCheckbox = document.getElementById('overrideCheckbox');
+      const startButton = document.getElementById('startButton');
+
+      let answerer;
+
+      function addLine(container, text) {
+        const line = document.createElement('p');
+        line.textContent = text;
+        container.appendChild(line);
+      }
+
+      function logState(text) {
+        addLine(connectionStates, text);
+      }
+
+      function logConnectionState(name, peerConnection) {
+        logState(`Peer Connection State has changed: ${peerConnection.connectionState} (${name})`);
+      }
+
+      // This is the only handoff-specific code in the page. Everything below
+      // is standard WebRTC app code, so this shows how little needs to change
+      // to redirect an existing answerer to the backend.
+      function toggleOverride() {
+        if (overrideCheckbox.checked) {
+          logState('Override enabled: the answerer API will be redirected to the backend.');
+          handoff.Start();
+
+          return;
+        }
+
+        logState('Override disabled: the answerer API will no longer be redirected to the backend.');
+        handoff.Stop();
+      }
+
+      function showRemoteVideo(event, name) {
+        const [stream] = event.streams;
+        if (!stream) {
+          return;
+        }
+
+        remoteVideo.srcObject = stream;
+        logState(`Remote video received (${name})`);
+      }
+
+      function preferVP8(transceiver) {
+        const capabilities = window.RTCRtpSender?.getCapabilities?.('video');
+        if (!capabilities) {
+          return;
+        }
+
+        const codecs = capabilities.codecs.filter(codec => codec.mimeType === 'video/VP8');
+        if (codecs.length > 0) {
+          transceiver.setCodecPreferences(codecs);
+        }
+      }
+
+      function createOfferer(stream) {
+        const peerConnection = new NativeRTCPeerConnection();
+        const [track] = stream.getVideoTracks();
+        const transceiver = peerConnection.addTransceiver(track, {
+          direction: 'sendrecv',
+          streams: [stream],
+        });
+
+        preferVP8(transceiver);
+        peerConnection.onconnectionstatechange = () => {
+          logConnectionState('offerer', peerConnection);
+        };
+        peerConnection.ontrack = event => {
+          showRemoteVideo(event, 'offerer');
+        };
+        peerConnection.onicecandidate = ({ candidate }) => {
+          if (!answerer || !candidate) {
+            return;
+          }
+
+          answerer.addIceCandidate(candidate).catch(error => {
+            logState(`Offerer ICE error: ${error.message}`);
+          });
+        };
+
+        return peerConnection;
+      }
+
+      async function start() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+          const offerer = createOfferer(stream);
+
+          localVideo.srcObject = stream;
+          answerer = new RTCPeerConnection();
+
+          answerer.onconnectionstatechange = () => {
+            logConnectionState('answerer', answerer);
+          };
+          answerer.ontrack = event => {
+            showRemoteVideo(event, 'answerer');
+          };
+
+          answerer.onicecandidate = ({ candidate }) => {
+            if (!candidate) {
+              return;
+            }
+
+            offerer.addIceCandidate(candidate).catch(error => {
+              logState(`Answerer ICE error: ${error.message}`);
+            });
+          };
+
+          const offer = await offerer.createOffer();
+          await offerer.setLocalDescription(offer);
+          await answerer.setRemoteDescription(offer);
+
+          const answer = await answerer.createAnswer();
+          await answerer.setLocalDescription(answer);
+          await offerer.setRemoteDescription(answer);
+        } catch (error) {
+          logState(`Connection failed: ${error.message}`);
+        }
+      }
+    </script>
+  </body>
+</html>
