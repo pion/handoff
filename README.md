@@ -1,9 +1,9 @@
 <h1 align="center">
   <br>
-  Handoff
+  Pion Handoff
   <br>
 </h1>
-<h4 align="center">Start WebRTC in the browser—run it somewhere else</h4>
+<h4 align="center">Create WebRTC session in the browser—run it somewhere else</h4>
 <p align="center">
   <a href="https://discord.gg/PngbdqpFbt"><img src="https://img.shields.io/badge/join-us%20on%20discord-gray.svg?longCache=true&logo=discord&colorB=brightblue" alt="join us on Discord"></a> <a href="https://bsky.app/profile/pion.ly"><img src="https://img.shields.io/badge/follow-us%20on%20bluesky-gray.svg?longCache=true&logo=bluesky&colorB=brightblue" alt="Follow us on Bluesky"></a> <a href="https://twitter.com/_pion?ref_src=twsrc%5Etfw"><img src="https://img.shields.io/twitter/url.svg?label=Follow%20%40_pion&style=social&url=https%3A%2F%2Ftwitter.com%2F_pion" alt="Twitter Widget"></a>
   <a href="https://github.com/pion/awesome-pion" alt="Awesome Pion"><img src="https://cdn.rawgit.com/sindresorhus/awesome/d7305f38d29fed78fa85652e3a63e154dd8e8829/media/badge.svg"></a>
@@ -11,10 +11,30 @@
 </p>
 <br>
 
-### Usage
-**[datachannel](examples/datachannel)** is a minimal HTTP server that serves a browser demo where the offerer sends DataChannel messages every second, and the answerer API can be redirected to the backend with proxied `RTCPeerConnection` method calls over a WebRTC control session.
+### Why
+WebRTC is the real-time communication technology used for real-time media streaming. Used for things like Google Meet, Discord and Zoom on the web.
+With `Handoff` you create your WebRTC session in the browser, but then move it to a process you control. This lets you do a few interesting things.
 
-The root package exposes `handoff.NewServer()` and `server.SetupHandlers(mux)` so you can mount the handoff endpoints and serve the browser-side [`handoff.js`](handoff.js) override library from your own `http.ServeMux`. The browser library exposes `handoff.Start()` and establishes one WebRTC control session per page/tab.
+```mermaid
+sequenceDiagram
+    participant Handoff
+    participant Browser
+    participant Website
+
+    Browser->>Website: Authenticate and use the site normally
+    Website->>Browser: WebRTC Signaling
+    Note over Browser: WebRTC API is mocked
+    Browser->>Handoff: Forward Signaling
+    Handoff->>Website: Establish WebRTC session
+```
+
+* **Record** - Join the Zoom call via `handoff` and save media as it passes through.
+* **Send** - Use FFmpeg or send an external source. Not limited by browser quality/capture code.
+* **Reverse Engineer**  - Capture ICE/DTLS and decrypted RTP/RTCP/SCTP traffic
+
+### Usage
+
+See `examples` directory. Most common use cases are covered, but `handshake` is exposed as an API if you want to add custom behavior.
 
 ### Community
 Pion has an active community on the [Discord](https://discord.gg/PngbdqpFbt).
