@@ -36,7 +36,8 @@ sequenceDiagram
 
 See `examples` directory. `examples/datachannel` shows a normal page with an
 optional override, `examples/media-save` saves VP8 video on the backend while
-still showing it in the browser, and `examples/greasemonkey` generates a
+still showing it in the browser, `examples/media-send` forwards VP8 RTP from
+the backend into the browser, and `examples/greasemonkey` generates a
 userscript that overrides `RTCPeerConnection` automatically.
 
 Typically you will install the greasemonkey script and then run one of the examples.
