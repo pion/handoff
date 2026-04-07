@@ -15,6 +15,10 @@
 WebRTC is the real-time communication technology used for real-time media streaming. Used for things like Google Meet, Discord and Zoom on the web.
 With `Handoff` you create your WebRTC session in the browser, but then move it to a process you control. This lets you do a few interesting things.
 
+* **Record** - Join the Zoom call via `handoff` and save media as it passes through.
+* **Send** - Use FFmpeg or send an external source. Not limited by browser quality/capture code.
+* **Reverse Engineer**  - Capture ICE/DTLS and decrypted RTP/RTCP/SCTP traffic
+
 ```mermaid
 sequenceDiagram
     participant Handoff
@@ -27,11 +31,6 @@ sequenceDiagram
     Browser->>Handoff: Forward Signaling
     Handoff->>Website: Establish WebRTC session
 ```
-
-* **Record** - Join the Zoom call via `handoff` and save media as it passes through.
-* **Send** - Use FFmpeg or send an external source. Not limited by browser quality/capture code.
-* **Reverse Engineer**  - Capture ICE/DTLS and decrypted RTP/RTCP/SCTP traffic
-
 ### Usage
 
 See `examples` directory. `examples/datachannel` shows a normal page with an
@@ -41,6 +40,13 @@ the backend into the browser, and `examples/greasemonkey` generates a
 userscript that overrides `RTCPeerConnection` automatically.
 
 Typically you will install the greasemonkey script and then run one of the examples.
+
+### Example
+
+Below is an example of sending a users webcam to a WebRTC service, but replacing outgoing video with a ffmpeg testsrc.
+Handoff sits between the users so it can replace with any arbitrary video.
+
+![Example](https://github.com/user-attachments/assets/3761e892-af0b-482a-915d-f4c9cb1c8df7)
 
 ### Community
 Pion has an active community on the [Discord](https://discord.gg/PngbdqpFbt).
