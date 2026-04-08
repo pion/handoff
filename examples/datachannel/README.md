@@ -1,4 +1,4 @@
-# basic
+# datachannel
 datachannel demonstrates how handoff can move a RTCPeerConnection
 to a backend Go process. If you press `start` both PeerConnections will
 run in the browser. If you check `Override` handoff is enabled and will
